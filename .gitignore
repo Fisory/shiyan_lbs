@@ -1,0 +1,9 @@
+models/
+outputs/
+__pycache__/
+*.pyc
+.venv/
+.uv/
+uv.lock
+*.pkl
+*.npz

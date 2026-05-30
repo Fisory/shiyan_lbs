@@ -1,0 +1,14 @@
+[project]
+name = "shiyan-lbs"
+version = "0.1.0"
+description = "SMPL Linear Blend Skinning 实验"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "smplx>=0.1.28",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "imageio>=2.31",
+    "imageio-ffmpeg>=0.4",
+]
