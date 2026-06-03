@@ -123,14 +123,14 @@ model = smplx.create(
 顶点数:      6890
 面片数:      13776
 关节数:      24
-betas 维度:  300
+betas 维度:  10
 ```
 
 ### 4.2 模板网格与蒙皮权重（任务 2）
 
-【视频1:权重热力图——左图模板网格，右图选取左手腕关节（joint 18）的权重热力图，颜色越亮代表该关节对该区域影响越大】
+【视频1:权重热力图——左图模板网格，右图选取左手腕关节（joint 20）的权重热力图，颜色越亮代表该关节对该区域影响越大】
 
-选了 joint 18（左手腕）作为示例——颜色集中在左前臂和手部区域，越靠近腕关节颜色越亮，往躯干方向权重快速衰减到零，符合直觉。
+选了 joint 20（左手腕）作为示例——颜色集中在左前臂末端和手部区域，越靠近腕关节颜色越亮，往躯干方向权重快速衰减到零，符合直觉。
 
 额外生成了一张全关节主导图 `all_joint_weights.png`，每个面片按"主导关节"着色：可以看到躯干区域被脊柱关节主导，手臂被肩/肘/腕分段控制，腿部被髋/膝/踝分段控制。
 
@@ -229,13 +229,13 @@ print(f"Max: {diff.max():.6f} m")
 
 ### 4.8 姿态动画（选做）
 
-固定 $\beta$，让双肘关节从 0° 逐渐弯曲到约 180° 再回到 0°，生成 36 帧并导出 GIF：
+固定 $\beta$，让双肘关节从 0° 逐渐弯曲到约 83° 再回到 0°，生成 36 帧并导出 GIF：
 
 ```python
 for i in range(n_frames):
-    angle = np.pi * np.sin(t * np.pi)   # 正弦曲线驱动，保证起止平滑
-    pa[0, 3 * 16 + 2] =  angle          # 左肘
-    pa[0, 3 * 13 + 2] = -angle          # 右肘（镜像）
+    angle = 1.45 * np.sin(t * np.pi)    # 正弦曲线驱动，保证起止平滑
+    pa[0, 3 * 18 + 2] =  angle          # 左肘
+    pa[0, 3 * 19 + 2] = -angle          # 右肘（镜像）
     verts_frame, ... = lbs_forward(...)
 ```
 
@@ -245,6 +245,11 @@ for i in range(n_frames):
 - 手和前臂跟着上臂一起转，权重过渡区域自然拉伸
 
 【视频5:姿态动画 GIF——双肘从伸直到弯曲再回到伸直，右侧对应角度显示，蒙皮区域平滑跟随骨骼运动】
+
+另外额外生成两个展示型 GIF：
+
+- `pipeline_animation.gif`：把 template → shaped → pose corrective → final LBS 连续过渡成动画，便于展示每一步到底改变了什么。
+- `joint_weight_sweep.gif`：轮播多个代表关节的蒙皮权重热力图，展示权重如何沿躯干、手臂和手部平滑分布。
 
 ---
 
@@ -270,6 +275,8 @@ outputs/
 ├── stage_c_pose_offsets.png
 ├── stage_d_lbs_result.png
 ├── comparison_grid.png
+├── pipeline_animation.gif
+├── joint_weight_sweep.gif
 ├── pose_animation.gif
 └── summary.txt
 ```
@@ -282,7 +289,7 @@ outputs/
 
 ![stage_a_template_weights](outputs/stage_a_template_weights.png)
 
-左图是 T-pose 下的模板网格；右图展示 joint 18（左手腕）的蒙皮权重——手部和前臂末端颜色最亮，越靠近躯干越暗，权重平滑衰减。
+左图是 T-pose 下的模板网格；右图展示 joint 20（左手腕）的蒙皮权重——手部和前臂末端颜色最亮，越靠近躯干越暗，权重平滑衰减。
 
 ### 阶段 (b)：形状变化与关节回归
 
@@ -314,6 +321,18 @@ $\beta_0 = 2.0$（偏胖），$\beta_1 = -1.5$（偏高），体型明显变化�
 
 双肘弯曲动画，36 帧，可以观察蒙皮权重区域如何随骨骼运动被平滑带动。
 
+### LBS 流程动画
+
+![pipeline_animation](outputs/pipeline_animation.gif)
+
+从模板网格连续过渡到形状校正、姿态校正和最终蒙皮结果，适合在答辩或报告里直接说明完整前向流程。
+
+### 多关节权重轮播
+
+![joint_weight_sweep](outputs/joint_weight_sweep.gif)
+
+轮播 pelvis、spine、shoulder、elbow、wrist、hand 等代表关节的权重热力图，展示 LBS 权重在身体不同区域的控制范围。
+
 ---
 
 ## 7 遇到的问题和解决
@@ -322,7 +341,7 @@ $\beta_0 = 2.0$（偏胖），$\beta_1 = -1.5$（偏高），体型明显变化�
 
 2. **`posedirs` 的维度**：pkl 文件里原始是 `(V, 3, P)`，smplx 加载时会 reshape + 转置成 `(P, V*3)`。直接 `torch.matmul(pose_feature, posedirs)` 就对，不用再手动转置，踩坑在这里浪费了不少时间。
 
-3. **matplotlib 3D 渲染速度**：14k 个三角面全渲会很慢（约 10+ 秒一张），而且 `Poly3DCollection` 的 z-sort 在某些角度会有穿插。最终决定子采样到 7000 个面，加了 `zsort='average'` 并固定视角，效果可以接受。
+3. **matplotlib 3D 渲染速度**：14k 个三角面全渲会比较慢，而且 `Poly3DCollection` 的 z-sort 在某些角度会有穿插。最终静态图保留完整面片以保证报告观感，GIF 固定子采样到约 4200 个面来控制文件体积和生成时间。
 
 4. **父关节索引越界**：`parents[0] = -1`，在 Python 里 `-1` 作为列表索引会取最后一个元素，不会报错但逻辑是错的。需要用 `parents[i].item()` 从索引 1 开始遍历，永远不接触 `parents[0]`。
 

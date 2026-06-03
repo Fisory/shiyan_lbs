@@ -11,4 +11,5 @@ dependencies = [
     "matplotlib>=3.7",
     "imageio>=2.31",
     "imageio-ffmpeg>=0.4",
+    "scipy>=1.15.3",
 ]

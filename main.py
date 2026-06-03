@@ -5,23 +5,64 @@
 """
 
 import os
-import sys
+import inspect
+from collections import namedtuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-import smplx
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import imageio.v2 as imageio
+
+
+def _patch_legacy_smpl_dependencies():
+    """Keep legacy SMPL/chumpy pickle loading working on modern Python."""
+    if not hasattr(inspect, 'getargspec'):
+        ArgSpec = namedtuple('ArgSpec', 'args varargs keywords defaults')
+
+        def getargspec(func):
+            spec = inspect.getfullargspec(func)
+            return ArgSpec(spec.args, spec.varargs, spec.varkw, spec.defaults)
+
+        inspect.getargspec = getargspec
+
+    numpy_aliases = {
+        'bool': np.bool_,
+        'int': int,
+        'float': float,
+        'complex': complex,
+        'object': object,
+        'unicode': str,
+        'str': str,
+    }
+    for name, value in numpy_aliases.items():
+        if name not in np.__dict__:
+            setattr(np, name, value)
+
+
+_patch_legacy_smpl_dependencies()
+import smplx
 
 os.makedirs('outputs', exist_ok=True)
 
 # 把 SMPL_NEUTRAL.pkl 放在 models/ 下
 SMPL_MODEL_PATH = 'models/SMPL_NEUTRAL.pkl'
 DEVICE = torch.device('cpu')
+
+# SMPL 24 关节的常见顺序，便于图标题和报告描述保持一致
+SMPL_JOINT_NAMES = [
+    'pelvis', 'left_hip', 'right_hip', 'spine1',
+    'left_knee', 'right_knee', 'spine2', 'left_ankle',
+    'right_ankle', 'spine3', 'left_foot', 'right_foot',
+    'neck', 'left_collar', 'right_collar', 'head',
+    'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+    'left_wrist', 'right_wrist', 'left_hand', 'right_hand',
+]
+LEFT_ELBOW = 18
+RIGHT_ELBOW = 19
+LEFT_WRIST = 20
 
 # 固定随机种子，保证各阶段使用同一组子采样面片
 RNG = np.random.default_rng(42)
@@ -173,14 +214,48 @@ def lbs_forward(betas, pose, v_template, shapedirs, posedirs,
 # 渲染工具
 # =========================================================
 
-def _make_poly3d(verts_np, faces_subset, facecolors, alpha=0.88):
-    tri = verts_np[faces_subset]
+def to_plot_coords(points_np):
+    """Map SMPL's Y-up coordinates to Matplotlib's Z-up display coordinates."""
+    points = np.asarray(points_np)
+    return points[..., [0, 2, 1]]
+
+
+def set_axis_limits(ax, verts_np, pad=0.05):
+    verts_plot = to_plot_coords(verts_np)
+    ax.set_xlim(verts_plot[:, 0].min() - pad, verts_plot[:, 0].max() + pad)
+    ax.set_ylim(verts_plot[:, 1].min() - pad, verts_plot[:, 1].max() + pad)
+    ax.set_zlim(verts_plot[:, 2].min() - pad, verts_plot[:, 2].max() + pad)
+
+
+def _make_poly3d(verts_np, faces_subset, facecolors, alpha=0.96):
+    tri = to_plot_coords(verts_np)[faces_subset]
     return Poly3DCollection(tri, alpha=alpha, facecolor=facecolors, edgecolor='none', zsort='average')
+
+
+def figure_to_rgb(fig):
+    """Matplotlib figure -> RGB image array, compatible with newer Matplotlib."""
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    return np.ascontiguousarray(rgba[:, :, :3])
+
+
+def compute_equal_limits(verts_list, pad=0.08):
+    """Return equal 3D axis limits covering every vertex array in verts_list."""
+    all_verts = np.concatenate([to_plot_coords(v) for v in verts_list], axis=0)
+    mins = all_verts.min(axis=0)
+    maxs = all_verts.max(axis=0)
+    center = (mins + maxs) * 0.5
+    radius = (maxs - mins).max() * 0.5 + pad
+    return [(center[i] - radius, center[i] + radius) for i in range(3)]
+
+
+def smoothstep(x):
+    return x * x * (3.0 - 2.0 * x)
 
 
 def render_mesh(verts_np, faces_np, face_idx,
                 facecolors=None, joint_positions=None,
-                title="", figsize=(5, 7), elev=10, azim=65):
+                title="", figsize=(5, 7), elev=5, azim=-90):
     """
     matplotlib 3D 渲染网格，返回 (H, W, 3) uint8 数组。
     face_idx: 预选的面片子集索引（固定随机种子，保证各图一致）
@@ -193,12 +268,10 @@ def render_mesh(verts_np, faces_np, face_idx,
     ax.add_collection3d(_make_poly3d(verts_np, faces_np[face_idx], facecolors))
 
     pad = 0.06
-    ax.set_xlim(verts_np[:, 0].min() - pad, verts_np[:, 0].max() + pad)
-    ax.set_ylim(verts_np[:, 1].min() - pad, verts_np[:, 1].max() + pad)
-    ax.set_zlim(verts_np[:, 2].min() - pad, verts_np[:, 2].max() + pad)
+    set_axis_limits(ax, verts_np, pad=pad)
 
     if joint_positions is not None:
-        jp = np.array(joint_positions)
+        jp = to_plot_coords(np.array(joint_positions))
         ax.scatter(jp[:, 0], jp[:, 1], jp[:, 2],
                    c='#FF4444', s=28, zorder=6, depthshade=False)
 
@@ -206,9 +279,32 @@ def render_mesh(verts_np, faces_np, face_idx,
     ax.set_title(title, fontsize=11, pad=8)
     ax.set_axis_off()
     fig.tight_layout(pad=0.4)
-    fig.canvas.draw()
-    buf  = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img  = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img = figure_to_rgb(fig)
+    plt.close(fig)
+    return img
+
+
+def render_mesh_gif_frame(verts_np, faces_np, face_idx, facecolors,
+                          title, limits, joint_positions=None,
+                          figsize=(4.2, 5.4), dpi=95,
+                          elev=5, azim=-90):
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.add_collection3d(_make_poly3d(verts_np, faces_np[face_idx], facecolors, alpha=0.95))
+
+    if joint_positions is not None:
+        jp = to_plot_coords(np.array(joint_positions))
+        ax.scatter(jp[:, 0], jp[:, 1], jp[:, 2],
+                   c='#E22B2B', s=20, zorder=6, depthshade=False)
+
+    ax.set_xlim(*limits[0])
+    ax.set_ylim(*limits[1])
+    ax.set_zlim(*limits[2])
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_title(title, fontsize=10, pad=7)
+    ax.set_axis_off()
+    fig.tight_layout(pad=0.25)
+    img = figure_to_rgb(fig)
     plt.close(fig)
     return img
 
@@ -258,9 +354,10 @@ def main():
     print(f"  关节数:      {n_joints}")
     print(f"  betas 维度:  {n_betas}")
 
-    # 固定子采样面片（加快渲染，全部面片约 14k，matplotlib 3D 渲染会很慢）
-    N_DRAW = min(7000, n_faces)
-    face_idx = RNG.choice(n_faces, N_DRAW, replace=False)
+    # 静态图使用完整面片保证观感；GIF 使用固定子采样面片控制体积和运行时间。
+    N_DRAW = n_faces
+    face_idx = np.arange(n_faces)
+    gif_face_idx = RNG.choice(n_faces, min(4200, n_faces), replace=False)
 
     verts_t = v_template.cpu().numpy()
 
@@ -269,7 +366,7 @@ def main():
     # ================================================
     print("\n[A] 模板网格与蒙皮权重 ...")
 
-    JOINT_VIZ = 18  # 左手腕
+    JOINT_VIZ = LEFT_WRIST  # 左手腕
     weight_map = lbs_weights[:, JOINT_VIZ].cpu().numpy()
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 7),
@@ -279,21 +376,18 @@ def main():
     ax = axes[0]
     fc_default = np.full((N_DRAW, 3), [0.72, 0.72, 0.82])
     ax.add_collection3d(_make_poly3d(verts_t, faces_np[face_idx], fc_default))
-    ax.set_xlim(verts_t[:, 0].min(), verts_t[:, 0].max())
-    ax.set_ylim(verts_t[:, 1].min(), verts_t[:, 1].max())
-    ax.set_zlim(verts_t[:, 2].min(), verts_t[:, 2].max())
-    ax.view_init(elev=10, azim=65); ax.set_axis_off()
+    set_axis_limits(ax, verts_t, pad=0.0)
+    ax.view_init(elev=5, azim=-90); ax.set_axis_off()
     ax.set_title(r'Template Mesh $\bar{T}$  (T-pose)', fontsize=12)
 
     # 右图：关节 JOINT_VIZ 的权重热力图
     ax = axes[1]
     fc_w = face_colors_from_vertex(weight_map, faces_np[face_idx], 'hot')
     ax.add_collection3d(_make_poly3d(verts_t, faces_np[face_idx], fc_w))
-    ax.set_xlim(verts_t[:, 0].min(), verts_t[:, 0].max())
-    ax.set_ylim(verts_t[:, 1].min(), verts_t[:, 1].max())
-    ax.set_zlim(verts_t[:, 2].min(), verts_t[:, 2].max())
-    ax.view_init(elev=10, azim=65); ax.set_axis_off()
-    ax.set_title(f'Joint {JOINT_VIZ} (L-Wrist) Skinning Weights', fontsize=12)
+    set_axis_limits(ax, verts_t, pad=0.0)
+    ax.view_init(elev=5, azim=-90); ax.set_axis_off()
+    ax.set_title(f'Joint {JOINT_VIZ} ({SMPL_JOINT_NAMES[JOINT_VIZ]}) Skinning Weights',
+                 fontsize=12)
 
     sm = plt.cm.ScalarMappable(cmap='hot', norm=plt.Normalize(0, 1))
     sm.set_array([])
@@ -317,10 +411,8 @@ def main():
     fig = plt.figure(figsize=(6, 8))
     ax  = fig.add_subplot(111, projection='3d')
     ax.add_collection3d(_make_poly3d(verts_t, faces_np[face_idx], fc_dom))
-    ax.set_xlim(verts_t[:, 0].min(), verts_t[:, 0].max())
-    ax.set_ylim(verts_t[:, 1].min(), verts_t[:, 1].max())
-    ax.set_zlim(verts_t[:, 2].min(), verts_t[:, 2].max())
-    ax.view_init(elev=10, azim=65); ax.set_axis_off()
+    set_axis_limits(ax, verts_t, pad=0.0)
+    ax.view_init(elev=5, azim=-90); ax.set_axis_off()
     ax.set_title('All-Joint Dominant Weight Distribution', fontsize=12)
     plt.tight_layout()
     plt.savefig('outputs/all_joint_weights.png', dpi=150, bbox_inches='tight')
@@ -347,12 +439,11 @@ def main():
     fig  = plt.figure(figsize=(5, 7))
     ax   = fig.add_subplot(111, projection='3d')
     ax.add_collection3d(_make_poly3d(vs_np, faces_np[face_idx], fc_b))
-    ax.scatter(jb_np[:, 0], jb_np[:, 1], jb_np[:, 2],
+    jb_plot = to_plot_coords(jb_np)
+    ax.scatter(jb_plot[:, 0], jb_plot[:, 1], jb_plot[:, 2],
                c='red', s=28, zorder=6, depthshade=False, label='Regressed joints')
-    ax.set_xlim(vs_np[:, 0].min() - 0.05, vs_np[:, 0].max() + 0.05)
-    ax.set_ylim(vs_np[:, 1].min() - 0.05, vs_np[:, 1].max() + 0.05)
-    ax.set_zlim(vs_np[:, 2].min() - 0.05, vs_np[:, 2].max() + 0.05)
-    ax.view_init(elev=10, azim=65); ax.set_axis_off()
+    set_axis_limits(ax, vs_np, pad=0.05)
+    ax.view_init(elev=5, azim=-90); ax.set_axis_off()
     ax.set_title('(b) $v_{shaped} = \\bar{T} + B_S(\\beta)$\n+ regressed joints $J(\\beta)$',
                  fontsize=11)
     ax.legend(loc='upper right', fontsize=9)
@@ -367,8 +458,8 @@ def main():
     print("\n[C] 姿态校正 B_P(θ) ...")
 
     pose = torch.zeros(1, n_joints * 3, device=DEVICE)
-    pose[0, 3 * 16 + 2] =  1.3   # 左肘弯曲 ~75°
-    pose[0, 3 * 13 + 2] = -1.3   # 右肘对称
+    pose[0, 3 * LEFT_ELBOW + 2] =  1.3   # 左肘弯曲 ~75°
+    pose[0, 3 * RIGHT_ELBOW + 2] = -1.3  # 右肘对称
     pose[0, 3 *  3 + 0] =  0.25  # spine1 前倾
     pose[0, 3 *  9 + 0] = -0.15  # spine3 后倾（保持平衡）
 
@@ -390,13 +481,11 @@ def main():
     fig = plt.figure(figsize=(5, 7))
     ax  = fig.add_subplot(111, projection='3d')
     ax.add_collection3d(_make_poly3d(vpc_np, faces_np[face_idx], fc_c))
-    ax.set_xlim(vpc_np[:, 0].min() - 0.05, vpc_np[:, 0].max() + 0.05)
-    ax.set_ylim(vpc_np[:, 1].min() - 0.05, vpc_np[:, 1].max() + 0.05)
-    ax.set_zlim(vpc_np[:, 2].min() - 0.05, vpc_np[:, 2].max() + 0.05)
+    set_axis_limits(ax, vpc_np, pad=0.05)
     sm2 = plt.cm.ScalarMappable(cmap='plasma', norm=plt.Normalize(0, 1))
     sm2.set_array([])
     fig.colorbar(sm2, ax=ax, shrink=0.4, aspect=18, label='|pose offset| (norm.)')
-    ax.view_init(elev=10, azim=65); ax.set_axis_off()
+    ax.view_init(elev=5, azim=-90); ax.set_axis_off()
     ax.set_title('(c) Pose Corrective $B_P(\\theta)$\ncolor = offset magnitude',
                  fontsize=11)
     plt.tight_layout()
@@ -422,12 +511,11 @@ def main():
     fig = plt.figure(figsize=(5, 7))
     ax  = fig.add_subplot(111, projection='3d')
     ax.add_collection3d(_make_poly3d(vd_np, faces_np[face_idx], fc_d))
-    ax.scatter(jd_np[:, 0], jd_np[:, 1], jd_np[:, 2],
+    jd_plot = to_plot_coords(jd_np)
+    ax.scatter(jd_plot[:, 0], jd_plot[:, 1], jd_plot[:, 2],
                c='red', s=25, zorder=6, depthshade=False)
-    ax.set_xlim(vd_np[:, 0].min() - 0.05, vd_np[:, 0].max() + 0.05)
-    ax.set_ylim(vd_np[:, 1].min() - 0.05, vd_np[:, 1].max() + 0.05)
-    ax.set_zlim(vd_np[:, 2].min() - 0.05, vd_np[:, 2].max() + 0.05)
-    ax.view_init(elev=10, azim=65); ax.set_axis_off()
+    set_axis_limits(ax, vd_np, pad=0.05)
+    ax.view_init(elev=5, azim=-90); ax.set_axis_off()
     ax.set_title('(d) Final LBS Result\n'
                  r"$v'_i = \sum_k w_{ik} G_k v_i^{posed}$", fontsize=11)
     plt.tight_layout()
@@ -466,9 +554,67 @@ def main():
     print("  -> outputs/comparison_grid.png")
 
     # ================================================
+    # 进阶 GIF：流程过渡 + 多关节权重轮播
+    # ================================================
+    print("\n[F] 生成进阶展示 GIF ...")
+
+    gif_limits = compute_equal_limits([verts_t, vs_np, vpc_np, vd_np], pad=0.08)
+    gif_n = len(gif_face_idx)
+    fc_template_gif = np.full((gif_n, 3), [0.72, 0.72, 0.82])
+    fc_shape_gif = np.full((gif_n, 3), [0.65, 0.78, 0.92])
+    fc_pose_gif = face_colors_from_vertex(offs_mag_norm, faces_np[gif_face_idx], 'plasma')
+    fc_final_gif = np.full((gif_n, 3), [0.62, 0.82, 0.62])
+
+    pipeline_segments = [
+        (verts_t, vs_np, fc_template_gif, fc_shape_gif,
+         None, jb_np, 'Template -> Shape blend'),
+        (vs_np, vpc_np, fc_shape_gif, fc_pose_gif,
+         jb_np, jb_np, 'Shape blend -> Pose corrective'),
+        (vpc_np, vd_np, fc_pose_gif, fc_final_gif,
+         jb_np, jd_np, 'Pose corrective -> Final LBS'),
+    ]
+
+    pipeline_frames = []
+    for v0, v1, c0, c1, j0, j1, label in pipeline_segments:
+        for k in range(9):
+            a = smoothstep(k / 8.0)
+            verts_mid = (1.0 - a) * v0 + a * v1
+            colors_mid = (1.0 - a) * c0 + a * c1
+            if j0 is None:
+                joints_mid = j1 if a > 0.55 else None
+            else:
+                joints_mid = (1.0 - a) * j0 + a * j1
+            pipeline_frames.append(render_mesh_gif_frame(
+                verts_mid, faces_np, gif_face_idx, colors_mid,
+                f'LBS pipeline: {label}', gif_limits,
+                joint_positions=joints_mid,
+                figsize=(4.2, 5.4), dpi=95, elev=5, azim=-90
+            ))
+
+    pipeline_frames.extend([pipeline_frames[-1]] * 6)
+    imageio.mimsave('outputs/pipeline_animation.gif', pipeline_frames, fps=10, loop=0)
+    print("  -> outputs/pipeline_animation.gif")
+
+    sweep_joints = [0, 3, 6, 12, 16, 18, 20, 22]
+    weight_frames = []
+    weight_limits = compute_equal_limits([verts_t], pad=0.08)
+    for joint_id in sweep_joints:
+        w = lbs_weights[:, joint_id].cpu().numpy()
+        fc_w_gif = face_colors_from_vertex(w, faces_np[gif_face_idx], 'hot')
+        title = f'Joint weight sweep: {joint_id} / {SMPL_JOINT_NAMES[joint_id]}'
+        frame = render_mesh_gif_frame(
+            verts_t, faces_np, gif_face_idx, fc_w_gif, title, weight_limits,
+            joint_positions=None, figsize=(4.2, 5.4), dpi=95, elev=5, azim=-90
+        )
+        weight_frames.extend([frame] * 5)
+
+    imageio.mimsave('outputs/joint_weight_sweep.gif', weight_frames, fps=10, loop=0)
+    print("  -> outputs/joint_weight_sweep.gif")
+
+    # ================================================
     # 一致性验证：手写 LBS vs 官方前向
     # ================================================
-    print("\n[F] 手写 LBS 与官方前向结果比对 ...")
+    print("\n[G] 手写 LBS 与官方前向结果比对 ...")
 
     global_orient = pose[:, :3].clone()
     body_pose     = pose[:, 3:].clone()
@@ -500,27 +646,28 @@ def main():
         f.write(f"最大绝对误差 (Max): {max_err:.6f} m\n\n")
         f.write("测试参数:\n")
         f.write(f"  betas[0:4]: {betas[0, :4].tolist()}\n")
-        f.write(f"  左肘 (joint 16, z): {pose[0, 3*16+2].item():.2f} rad\n")
-        f.write(f"  右肘 (joint 13, z): {pose[0, 3*13+2].item():.2f} rad\n")
+        f.write(f"  左肘 (joint {LEFT_ELBOW}, z): {pose[0, 3*LEFT_ELBOW+2].item():.2f} rad\n")
+        f.write(f"  右肘 (joint {RIGHT_ELBOW}, z): {pose[0, 3*RIGHT_ELBOW+2].item():.2f} rad\n")
         f.write(f"  spine1 (joint 3, x): {pose[0, 3*3+0].item():.2f} rad\n")
     print("  -> outputs/summary.txt")
 
     # ================================================
     # 选做：姿态动画（双肘弯曲 & 张开）
     # ================================================
-    print("\n[选做] 生成姿态动画 ...")
+    print("\n[H] 生成姿态动画 ...")
 
     betas_anim = betas.clone()
     n_frames   = 36
+    max_bend   = 1.45  # 约 83°，比 180° 极限折叠更适合正面展示
     frames     = []
 
     for i in range(n_frames):
         t     = i / (n_frames - 1)
-        angle = np.pi * np.sin(t * np.pi)  # 0 -> π -> 0，模拟一次完整弯曲
+        angle = max_bend * np.sin(t * np.pi)  # 0 -> max_bend -> 0，起止平滑
 
         pa = torch.zeros(1, n_joints * 3, device=DEVICE)
-        pa[0, 3 * 16 + 2] =  angle          # 左肘
-        pa[0, 3 * 13 + 2] = -angle          # 右肘（镜像）
+        pa[0, 3 * LEFT_ELBOW + 2] =  angle   # 左肘
+        pa[0, 3 * RIGHT_ELBOW + 2] = -angle  # 右肘（镜像）
         pa[0, 3 *  3 + 0] =  angle * 0.12   # 躯干随动
 
         va, _, _, _, _ = lbs_forward(
@@ -529,20 +676,16 @@ def main():
             J_regressor, parents, lbs_weights
         )
         va_np  = va[0].cpu().numpy()
-        fc_ani = np.full((N_DRAW, 3), [0.72, 0.72, 0.85])
+        fc_ani = np.full((len(gif_face_idx), 3), [0.72, 0.72, 0.85])
 
         fig = plt.figure(figsize=(3.5, 5), dpi=90)
         ax  = fig.add_subplot(111, projection='3d')
-        ax.add_collection3d(_make_poly3d(va_np, faces_np[face_idx], fc_ani))
-        ax.set_xlim(va_np[:, 0].min() - 0.05, va_np[:, 0].max() + 0.05)
-        ax.set_ylim(va_np[:, 1].min() - 0.05, va_np[:, 1].max() + 0.05)
-        ax.set_zlim(va_np[:, 2].min() - 0.05, va_np[:, 2].max() + 0.05)
-        ax.view_init(elev=8, azim=70); ax.set_axis_off()
+        ax.add_collection3d(_make_poly3d(va_np, faces_np[gif_face_idx], fc_ani))
+        set_axis_limits(ax, va_np, pad=0.05)
+        ax.view_init(elev=5, azim=-90); ax.set_axis_off()
         ax.set_title(f'Elbow bend: {np.degrees(angle):.0f}°', fontsize=10)
         fig.tight_layout(pad=0.3)
-        fig.canvas.draw()
-        buf   = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        frame = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,)).copy()
+        frame = figure_to_rgb(fig).copy()
         plt.close(fig)
         frames.append(frame)
 
