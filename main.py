@@ -6,6 +6,7 @@
 
 import os
 import inspect
+import shutil
 from collections import namedtuple
 import numpy as np
 import torch
@@ -309,6 +310,33 @@ def render_mesh_gif_frame(verts_np, faces_np, face_idx, facecolors,
     return img
 
 
+def render_weight_pair_gif_frame(verts_np, faces_np, face_idx,
+                                 template_colors, weight_colors,
+                                 title, limits, elev=5, azim=-90):
+    fig, axes = plt.subplots(
+        1, 2, figsize=(7.2, 4.8), dpi=95,
+        subplot_kw={'projection': '3d'}
+    )
+    for ax, colors, label in zip(
+        axes,
+        [template_colors, weight_colors],
+        ['Template mesh', 'Joint weight heatmap']
+    ):
+        ax.add_collection3d(_make_poly3d(verts_np, faces_np[face_idx], colors, alpha=0.96))
+        ax.set_xlim(*limits[0])
+        ax.set_ylim(*limits[1])
+        ax.set_zlim(*limits[2])
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(label, fontsize=9, pad=5)
+        ax.set_axis_off()
+
+    fig.suptitle(title, fontsize=11, y=0.97)
+    fig.tight_layout(pad=0.3)
+    img = figure_to_rgb(fig)
+    plt.close(fig)
+    return img
+
+
 def vertex_color_by_scalar(scalar_np, cmap='hot'):
     """顶点标量 -> 面片 facecolors（取三顶点均值后映射）"""
     return scalar_np  # 延迟到 render_mesh 调用处做 per-face 映射
@@ -565,6 +593,60 @@ def main():
     fc_pose_gif = face_colors_from_vertex(offs_mag_norm, faces_np[gif_face_idx], 'plasma')
     fc_final_gif = np.full((gif_n, 3), [0.62, 0.82, 0.62])
 
+    # 视频 1：模板网格与左手腕蒙皮权重热力图
+    video1_frames = []
+    video1_limits = compute_equal_limits([verts_t], pad=0.08)
+    fc_weight_gif = face_colors_from_vertex(weight_map, faces_np[gif_face_idx], 'hot')
+    for azim in np.concatenate([np.linspace(-105, -75, 12), np.linspace(-75, -105, 12)]):
+        video1_frames.append(render_weight_pair_gif_frame(
+            verts_t, faces_np, gif_face_idx,
+            fc_template_gif, fc_weight_gif,
+            f'Video 1: template and joint {JOINT_VIZ} weights',
+            video1_limits, elev=5, azim=azim
+        ))
+    imageio.mimsave('outputs/video1.gif', video1_frames, fps=12, loop=0)
+    print("  -> outputs/video1.gif")
+
+    # 视频 2：beta 从 0 平滑过渡到目标体型，关节位置同步回归
+    video2_frames = []
+    video2_limits = compute_equal_limits([verts_t, vs_np], pad=0.08)
+    for k in range(24):
+        a = smoothstep(k / 23.0)
+        betas_mid = betas * a
+        v_mid = v_template.unsqueeze(0) + blend_shapes(betas_mid, shapedirs)
+        j_mid = vertices2joints(J_regressor, v_mid)
+        video2_frames.append(render_mesh_gif_frame(
+            v_mid[0].cpu().numpy(), faces_np, gif_face_idx, fc_shape_gif,
+            f'Video 2: shape blend beta scale {a:.2f}',
+            video2_limits,
+            joint_positions=j_mid[0].cpu().numpy(),
+            figsize=(4.2, 5.4), dpi=95, elev=5, azim=-90
+        ))
+    imageio.mimsave('outputs/video2.gif', video2_frames, fps=12, loop=0)
+    print("  -> outputs/video2.gif")
+
+    # 视频 3：姿态校正随肘部弯曲增强，颜色显示 pose offset 大小
+    video3_frames = []
+    video3_limits = compute_equal_limits([vs_np, vpc_np], pad=0.08)
+    for k in range(24):
+        a = smoothstep(k / 23.0)
+        pose_mid = pose * a
+        rot_mid = batch_rodrigues(pose_mid.view(-1, 3)).view(1, n_j, 3, 3)
+        feat_mid = (rot_mid[:, 1:] - ident).view(1, -1)
+        offs_mid = torch.matmul(feat_mid, posedirs).view(1, -1, 3)
+        v_mid = v_shaped_c + offs_mid
+        offs_norm = torch.norm(offs_mid[0], dim=-1).cpu().numpy() / (offs_mag.max() + 1e-8)
+        fc_mid = face_colors_from_vertex(offs_norm, faces_np[gif_face_idx], 'plasma')
+        video3_frames.append(render_mesh_gif_frame(
+            v_mid[0].cpu().numpy(), faces_np, gif_face_idx, fc_mid,
+            f'Video 3: pose corrective scale {a:.2f}',
+            video3_limits,
+            joint_positions=jb_np,
+            figsize=(4.2, 5.4), dpi=95, elev=5, azim=-90
+        ))
+    imageio.mimsave('outputs/video3.gif', video3_frames, fps=12, loop=0)
+    print("  -> outputs/video3.gif")
+
     pipeline_segments = [
         (verts_t, vs_np, fc_template_gif, fc_shape_gif,
          None, jb_np, 'Template -> Shape blend'),
@@ -593,7 +675,9 @@ def main():
 
     pipeline_frames.extend([pipeline_frames[-1]] * 6)
     imageio.mimsave('outputs/pipeline_animation.gif', pipeline_frames, fps=10, loop=0)
+    imageio.mimsave('outputs/video4.gif', pipeline_frames, fps=10, loop=0)
     print("  -> outputs/pipeline_animation.gif")
+    print("  -> outputs/video4.gif")
 
     sweep_joints = [0, 3, 6, 12, 16, 18, 20, 22]
     weight_frames = []
@@ -690,7 +774,24 @@ def main():
         frames.append(frame)
 
     imageio.mimsave('outputs/pose_animation.gif', frames, fps=18, loop=0)
+    imageio.mimsave('outputs/video5.gif', frames, fps=18, loop=0)
     print("  -> outputs/pose_animation.gif")
+    print("  -> outputs/video5.gif")
+
+    # 给 README 使用的图片准备无下划线别名，兼容部分 Markdown -> LaTeX 流程。
+    alias_pairs = [
+        ('outputs/stage_a_template_weights.png', 'outputs/stagea.png'),
+        ('outputs/all_joint_weights.png', 'outputs/allweights.png'),
+        ('outputs/stage_b_shaped_joints.png', 'outputs/stageb.png'),
+        ('outputs/stage_c_pose_offsets.png', 'outputs/stagec.png'),
+        ('outputs/stage_d_lbs_result.png', 'outputs/staged.png'),
+        ('outputs/comparison_grid.png', 'outputs/comparison.png'),
+        ('outputs/joint_weight_sweep.gif', 'outputs/weightsweep.gif'),
+        ('outputs/pipeline_animation.gif', 'outputs/pipeline.gif'),
+        ('outputs/pose_animation.gif', 'outputs/pose.gif'),
+    ]
+    for src, dst in alias_pairs:
+        shutil.copyfile(src, dst)
 
     print("\n" + "=" * 50)
     print("全部完成，输出保存在 outputs/ 目录。")

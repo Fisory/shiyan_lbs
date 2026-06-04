@@ -128,7 +128,7 @@ betas 维度:  10
 
 ### 4.2 模板网格与蒙皮权重（任务 2）
 
-【视频1:权重热力图——左图模板网格，右图选取左手腕关节（joint 20）的权重热力图，颜色越亮代表该关节对该区域影响越大】
+![Video 1](outputs/video1.gif)
 
 选了 joint 20（左手腕）作为示例——颜色集中在左前臂末端和手部区域，越靠近腕关节颜色越亮，往躯干方向权重快速衰减到零，符合直觉。
 
@@ -151,7 +151,7 @@ v_shaped = v_template + blend_shapes(betas, shapedirs)
 J        = vertices2joints(J_regressor, v_shaped)
 ```
 
-【视频2:形状变化——β 从零缓慢变化，网格体型随之改变，关节点跟着在身体内部移动】
+![Video 2](outputs/video2.gif)
 
 **思考：**
 
@@ -171,7 +171,7 @@ v_posed = v_shaped + pose_offsets
 
 偏移量最大的区域集中在肘关节弯曲处和脊柱弯曲处——这正是 LBS 单靠刚体旋转最容易出现体积塌陷的地方。
 
-【视频3:姿态校正偏移——肘关节从直到弯，颜色热图展示偏移量在弯曲区域激增，补偿体积损失】
+![Video 3](outputs/video3.gif)
 
 注意：这一步还没有把顶点绑到骨骼上，`v_posed` 只是在形状网格上加了一层几何修正。
 
@@ -197,7 +197,7 @@ $$A_k = G_k \cdot \begin{pmatrix} I & -J_k^0 \\ 0 & 1 \end{pmatrix}$$
 
 这步"减去 rest-pose 关节位置"保证了在无旋转（T-pose）时 $A_k$ 恰好是恒等变换，顶点不会因为有一个初始偏移而跑飞。
 
-【视频4:完整 LBS——四阶段切换对比：T-pose → 形状变化 → 加 pose corrective → 最终蒙皮姿态】
+![Video 4](outputs/video4.gif)
 
 **思考：**
 
@@ -244,7 +244,7 @@ for i in range(n_frames):
 - 弯曲幅度越大，pose corrective 的贡献越明显（弯到极限时肘内侧不会塌陷）
 - 手和前臂跟着上臂一起转，权重过渡区域自然拉伸
 
-【视频5:姿态动画 GIF——双肘从伸直到弯曲再回到伸直，右侧对应角度显示，蒙皮区域平滑跟随骨骼运动】
+![Video 5](outputs/video5.gif)
 
 另外额外生成两个展示型 GIF：
 
@@ -270,11 +270,22 @@ uv run python main.py
 ```
 outputs/
 ├── stage_a_template_weights.png
+├── stagea.png
 ├── all_joint_weights.png
+├── allweights.png
 ├── stage_b_shaped_joints.png
+├── stageb.png
 ├── stage_c_pose_offsets.png
+├── stagec.png
 ├── stage_d_lbs_result.png
+├── staged.png
 ├── comparison_grid.png
+├── comparison.png
+├── video1.gif
+├── video2.gif
+├── video3.gif
+├── video4.gif
+├── video5.gif
 ├── pipeline_animation.gif
 ├── joint_weight_sweep.gif
 ├── pose_animation.gif
@@ -287,49 +298,49 @@ outputs/
 
 ### 阶段 (a)：模板网格与蒙皮权重
 
-![stage_a_template_weights](outputs/stage_a_template_weights.png)
+![Stage A](outputs/stagea.png)
 
 左图是 T-pose 下的模板网格；右图展示 joint 20（左手腕）的蒙皮权重——手部和前臂末端颜色最亮，越靠近躯干越暗，权重平滑衰减。
 
 ### 阶段 (b)：形状变化与关节回归
 
-![stage_b_shaped_joints](outputs/stage_b_shaped_joints.png)
+![Stage B](outputs/stageb.png)
 
 $\beta_0 = 2.0$（偏胖），$\beta_1 = -1.5$（偏高），体型明显变化；红点是从形状后网格回归出的关节位置，落在身体内部合理位置。
 
 ### 阶段 (c)：姿态校正偏移
 
-![stage_c_pose_offsets](outputs/stage_c_pose_offsets.png)
+![Stage C](outputs/stagec.png)
 
 偏移量用 plasma 色图渲染——肘关节和脊柱弯曲处颜色最亮，说明 pose corrective 主要在这些容易塌陷的区域发力。
 
 ### 阶段 (d)：完整 LBS 结果
 
-![stage_d_lbs_result](outputs/stage_d_lbs_result.png)
+![Stage D](outputs/staged.png)
 
 人体已经进入目标姿态（双肘弯曲、躯干前倾），红点是变换后的关节世界坐标。
 
 ### 四阶段对比
 
-![comparison_grid](outputs/comparison_grid.png)
+![Comparison](outputs/comparison.png)
 
 四个阶段排在一起，区别一目了然。
 
 ### 姿态动画
 
-![pose_animation](outputs/pose_animation.gif)
+![Pose animation](outputs/video5.gif)
 
 双肘弯曲动画，36 帧，可以观察蒙皮权重区域如何随骨骼运动被平滑带动。
 
 ### LBS 流程动画
 
-![pipeline_animation](outputs/pipeline_animation.gif)
+![Pipeline animation](outputs/video4.gif)
 
 从模板网格连续过渡到形状校正、姿态校正和最终蒙皮结果，适合在答辩或报告里直接说明完整前向流程。
 
 ### 多关节权重轮播
 
-![joint_weight_sweep](outputs/joint_weight_sweep.gif)
+![Joint weight sweep](outputs/weightsweep.gif)
 
 轮播 pelvis、spine、shoulder、elbow、wrist、hand 等代表关节的权重热力图，展示 LBS 权重在身体不同区域的控制范围。
 
