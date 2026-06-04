@@ -5,7 +5,7 @@
 这次实验围绕 SMPL 人体模型，把线性混合蒙皮（Linear Blend Skinning）从头手写一遍，逐步理解从模板网格到最终变形结果的每一步变换是怎么来的。具体要完成这几件事：
 
 - 搞清楚蒙皮权重是什么，以及它们在 T-pose 下如何分布
-- 手写形状校正 $B_S(\beta)$、姿态校正 $B_P(\theta)$、以及完整 LBS 的前向传播
+- 手写形状校正、姿态校正、以及完整 LBS 的前向传播
 - 用可视化对比四个阶段（template → shaped → posed → final），看清每一步对网格的影响
 - 把手写结果和官方前向做逐顶点误差比对，验证实现的正确性
 - 做一个简单的姿态动画，观察蒙皮权重区域怎么随骨骼运动被带动
@@ -18,7 +18,7 @@
 
 SMPL 的完整前向可以分四步走：
 
-$$\bar{T} \xrightarrow{B_S(\beta)} v_{shaped} \xrightarrow{B_P(\theta)} v_{posed} \xrightarrow{\text{LBS}} v'$$
+$$template \xrightarrow{shape} vShaped \xrightarrow{pose} vPosed \xrightarrow{\text{LBS}} verts$$
 
 每一步针对不同来源的形变，最终叠加在一起。
 
@@ -31,34 +31,34 @@ $$\bar{T} \xrightarrow{B_S(\beta)} v_{shaped} \xrightarrow{B_P(\theta)} v_{posed
 - 网格还没根据姿态弯曲
 - 但每个顶点已经知道"将来主要跟着哪些骨骼走"
 
-在 `lbs_forward()` 里，最终每个顶点的 $4 \times 4$ 变换矩阵，就是由这些 `lbs_weights` 对各关节变换矩阵加权得到的。
+在 lbsForward 里，最终每个顶点的 $4 \times 4$ 变换矩阵，就是由蒙皮权重对各关节变换矩阵加权得到的。
 
-### 2.3 形状参数 $B_S(\beta)$
+### 2.3 形状参数 beta
 
 $\beta$ 控制这个人长什么样：高矮、胖瘦、肩宽、腿长等，都对应形状空间里的某个系数方向。
 加了形状校正之后得到：
 
-$$v_{shaped} = \bar{T} + B_S(\beta) = \bar{T} + \text{blend\_shapes}(\beta, \text{shapedirs})$$
+$$vShaped = template + shapeOffset(\beta)$$
 
 然后用关节回归器从形状后的网格估计关节位置：
 
-$$J(\beta) = \mathcal{J} \cdot v_{shaped}$$
+$$J(\beta) = jointRegressor \cdot vShaped$$
 
 关节位置不是固定常数，而是从网格回归出来的——人变胖，肩关节就会跟着往外移。
 
-### 2.4 姿态相关校正 $B_P(\theta)$
+### 2.4 姿态相关校正
 
 骨骼旋转时，关节周围（肘部、膝盖、肩膀）会出现额外的几何变化，单靠刚体旋转无法表达。所以在进入真正的 LBS 之前，SMPL 还加了一项 pose blend shape：
 
-$$v_{posed} = v_{shaped} + B_P(\theta)$$
+$$vPosed = vShaped + poseOffset(\theta)$$
 
-具体实现是：先把轴角参数转成旋转矩阵，构造 $pose\_feature = R(\theta) - I$，再通过 `posedirs` 线性映射：
+具体实现是：先把轴角参数转成旋转矩阵，构造 poseFeature，再通过 pose directions 线性映射：
 
 ```python
-rot_mats     = batch_rodrigues(pose.view(-1, 3)).view(B, n_j, 3, 3)
-pose_feature = (rot_mats[:, 1:] - ident).view(B, -1)        # (B, P)
-pose_offsets = torch.matmul(pose_feature, posedirs).view(B, -1, 3)
-v_posed      = v_shaped + pose_offsets
+rotMats     = batchRodrigues(pose)
+poseFeature = rotMats[:, 1:] - identity
+poseOffsets = poseFeature @ poseDirs
+vPosed      = vShaped + poseOffsets
 ```
 
 这一步还没有真正把顶点绑到骨骼上。它只是说：即使不做蒙皮，网格本身也已经因为姿态发生了修正。
@@ -72,15 +72,15 @@ v_posed      = v_shaped + pose_offsets
 
 进入真正的 LBS：
 
-$$v'_i = \sum_{k=1}^{K} w_{ik} \, G_k(\theta, J(\beta)) \begin{bmatrix} v_i^{posed} \\ 1 \end{bmatrix}$$
+$$finalVertex(i) = sum(k=1..K, weight(i,k) transform(k) posedVertex(i))$$
 
-其中 $G_k$ 是第 $k$ 个关节在运动学链上的全局刚体变换，它把从根节点到 $k$ 的所有局部旋转都乘进来了。
+其中 transform(k) 是第 k 个关节在运动学链上的全局刚体变换，它把从根节点到 k 的所有局部旋转都乘进来了。
 
 ```python
-J_transformed, A = batch_rigid_transform(rot_mats, J_rest, parents)
-W = lbs_weights.unsqueeze(0).expand(B, -1, -1)
+jointMoved, A = rigidTransform(rotMats, jointRest, parents)
+W = skinWeights.expand(B, vertexCount, jointCount)
 T = torch.matmul(W, A.view(B, K, 16)).view(B, -1, 4, 4)   # 每顶点的混合变换
-verts = torch.matmul(T, v_posed_homo).squeeze(-1)[:, :, :3]
+verts = torch.matmul(T, vPosedHomo).squeeze(-1)[:, :, :3]
 ```
 
 每个顶点不是只跟着一个关节走，而是跟着多个关节做加权平均后的变换。这也是"Linear Blend Skinning"名字的来源。
@@ -93,11 +93,11 @@ verts = torch.matmul(T, v_posed_homo).squeeze(-1)[:, :, :3]
 
 | 变量 | 含义 |
 |------|------|
-| `v_template` | 模板顶点，T-pose，体型中性 |
-| `v_shaped`   | 加了形状形变 $B_S(\beta)$ 之后的顶点 |
-| `J`          | 由 `v_shaped` 回归出的关节坐标 |
-| `v_posed`    | 加了姿态校正 $B_P(\theta)$ 之后的顶点 |
-| `verts`      | 完成 LBS 之后的最终顶点 |
+| vTemplate | 模板顶点，T-pose，体型中性 |
+| vShaped | 加了形状形变之后的顶点 |
+| J | 由 vShaped 回归出的关节坐标 |
+| vPosed | 加了姿态校正之后的顶点 |
+| verts | 完成 LBS 之后的最终顶点 |
 
 ---
 
@@ -105,18 +105,13 @@ verts = torch.matmul(T, v_posed_homo).squeeze(-1)[:, :, :3]
 
 ### 4.1 加载 SMPL，输出基础信息（任务 1）
 
-把 `SMPL_NEUTRAL.pkl` 放在 `models/` 下之后，用 smplx 加载：
+把 SMPL neutral 模型 pkl 文件放在 models 目录下之后，用 smplx 加载：
 
 ```python
-model = smplx.create(
-    'models/SMPL_NEUTRAL.pkl',
-    model_type='smpl',
-    gender='neutral',
-    batch_size=1
-)
+model = smplx.create(modelPath, modelType='smpl', gender='neutral')
 ```
 
-从模型里取出五个核心 buffer：`v_template`、`shapedirs`、`posedirs`、`J_regressor`、`lbs_weights`，以及 `parents`（运动学树）和 `faces`（三角面索引）。
+从模型里取出五个核心 buffer：模板顶点、形状方向、姿态方向、关节回归器、蒙皮权重，以及 parents（运动学树）和 faces（三角面索引）。
 
 运行后会打印：
 ```
@@ -132,7 +127,7 @@ betas 维度:  10
 
 选了 joint 20（左手腕）作为示例——颜色集中在左前臂末端和手部区域，越靠近腕关节颜色越亮，往躯干方向权重快速衰减到零，符合直觉。
 
-额外生成了一张全关节主导图 `all_joint_weights.png`，每个面片按"主导关节"着色：可以看到躯干区域被脊柱关节主导，手臂被肩/肘/腕分段控制，腿部被髋/膝/踝分段控制。
+额外生成了一张全关节主导图 allweights.png，每个面片按"主导关节"着色：可以看到躯干区域被脊柱关节主导，手臂被肩/肘/腕分段控制，腿部被髋/膝/踝分段控制。
 
 **思考：**
 
@@ -142,13 +137,13 @@ betas 维度:  10
 
 ### 4.3 形状校正与关节回归（任务 3）
 
-给前几个 $\beta$ 设非零值（更胖、更高、肩宽微调），计算 `v_shaped` 和从中回归的关节 `J`：
+给前几个 $\beta$ 设非零值（更胖、更高、肩宽微调），计算 vShaped 和从中回归的关节 J：
 
 ```python
 betas[0, 0] =  2.0   # 体型偏胖
 betas[0, 1] = -1.5   # 身高偏高
-v_shaped = v_template + blend_shapes(betas, shapedirs)
-J        = vertices2joints(J_regressor, v_shaped)
+vShaped = vTemplate + blendShapes(betas, shapeDirs)
+J       = verticesToJoints(jointRegressor, vShaped)
 ```
 
 ![Video 2](outputs/video2.gif)
@@ -157,56 +152,56 @@ J        = vertices2joints(J_regressor, v_shaped)
 
 1. **关节位置为什么要从形状后的网格回归？** 人高了腿长了，膝关节理应在更低的位置；人变胖了，髋关节应该更宽。如果关节位置固定，形状变化后骨骼就和网格对不上了。
 2. **变胖/变瘦时关节会不会变化？** 会。肩宽增加时肩关节往两侧移；身高增加时所有沿 Y 轴分布的关节都会拉开。
-3. **`v_template` 与 `v_shaped` 的区别？** `v_shaped` = `v_template` + 形状偏移，后者是一个中性标准体型，前者已经应用了 $\beta$ 指定的个性体型。
+3. **vTemplate 与 vShaped 的区别？** vShaped = vTemplate + 形状偏移，后者是一个中性标准体型，前者已经应用了 $\beta$ 指定的个性体型。
 
-### 4.4 姿态校正 $B_P(\theta)$（任务 4）
+### 4.4 姿态校正（任务 4）
 
 设置一个非零姿态（双肘弯曲 ~75°，躯干前倾），计算姿态校正偏移并用颜色标出大小：
 
 ```python
-pose_feature = (rot_mats[:, 1:] - ident).view(B, -1)
-pose_offsets = torch.matmul(pose_feature, posedirs).view(B, -1, 3)
-v_posed = v_shaped + pose_offsets
+poseFeature = (rotMats[:, 1:] - identity).view(B, -1)
+poseOffsets = torch.matmul(poseFeature, poseDirs).view(B, -1, 3)
+vPosed = vShaped + poseOffsets
 ```
 
 偏移量最大的区域集中在肘关节弯曲处和脊柱弯曲处——这正是 LBS 单靠刚体旋转最容易出现体积塌陷的地方。
 
 ![Video 3](outputs/video3.gif)
 
-注意：这一步还没有把顶点绑到骨骼上，`v_posed` 只是在形状网格上加了一层几何修正。
+注意：这一步还没有把顶点绑到骨骼上，vPosed 只是在形状网格上加了一层几何修正。
 
 **思考：**
 
 1. **为什么 LBS 之前还要加 pose corrective？** 纯 LBS 在关节弯曲时会出现糖纸卷和体积塌陷，pose corrective 用一个学习到的线性修正补偿这些视觉缺陷。
-2. **去掉 `pose_offsets`**：弯肘时肘部会明显"压扁"，膝盖弯曲时膝盖内侧会出现几何自穿插。
-3. **`v_shaped` 与 `v_posed` 的本质区别？** `v_shaped` 只有体型信息，与姿态无关；`v_posed` 在 `v_shaped` 基础上叠加了当前姿态引发的局部几何修正，但顶点坐标仍在 rest-pose 的世界坐标系里（还没做骨骼变换）。
+2. **去掉 poseOffsets**：弯肘时肘部会明显"压扁"，膝盖弯曲时膝盖内侧会出现几何自穿插。
+3. **vShaped 与 vPosed 的本质区别？** vShaped 只有体型信息，与姿态无关；vPosed 在 vShaped 基础上叠加了当前姿态引发的局部几何修正，但顶点坐标仍在 rest-pose 的世界坐标系里（还没做骨骼变换）。
 
 ### 4.5 完整 LBS 结果（任务 5）
 
-沿运动学树累乘关节的局部变换，再用 `lbs_weights` 加权混合：
+沿运动学树累乘关节的局部变换，再用蒙皮权重加权混合：
 
 ```python
-J_transformed, A = batch_rigid_transform(rot_mats, J_rest, parents)
+jointMoved, A = rigidTransform(rotMats, jointRest, parents)
 T     = torch.matmul(W, A.view(B, K, 16)).view(B, -1, 4, 4)
-verts = torch.matmul(T, v_posed_homo).squeeze(-1)[:, :, :3]
+verts = torch.matmul(T, vPosedHomo).squeeze(-1)[:, :, :3]
 ```
 
-`batch_rigid_transform` 里有一步容易搞错的地方：最终的蒙皮矩阵 $A_k$ 不是直接用全局变换 $G_k$，而是
+rigidTransform 里有一步容易搞错的地方：最终的蒙皮矩阵 $A^{k}$ 不是直接用全局变换 $G^{k}$，而是
 
-$$A_k = G_k \cdot \begin{pmatrix} I & -J_k^0 \\ 0 & 1 \end{pmatrix}$$
+$$A^{k} = G^{k} \cdot invRest^{k}$$
 
-这步"减去 rest-pose 关节位置"保证了在无旋转（T-pose）时 $A_k$ 恰好是恒等变换，顶点不会因为有一个初始偏移而跑飞。
+这步"减去 rest-pose 关节位置"保证了在无旋转（T-pose）时 $A^{k}$ 恰好是恒等变换，顶点不会因为有一个初始偏移而跑飞。
 
 ![Video 4](outputs/video4.gif)
 
 **思考：**
 
-1. **`J` 和 `J_transformed` 的区别？** `J` 是 rest-pose 下由形状网格回归出的关节坐标（世界坐标，未旋转）；`J_transformed` 是经过运动学树全局变换后，关节在当前姿态下的世界坐标。
+1. **J 和 jointMoved 的区别？** J 是 rest-pose 下由形状网格回归出的关节坐标（世界坐标，未旋转）；jointMoved 是经过运动学树全局变换后，关节在当前姿态下的世界坐标。
 2. **为什么要加权和，不直接选最大权重关节？** 单关节控制（hard binding）会在关节过渡区出现硬折叠；加权混合让变换平滑过渡，是 LBS 的核心思想。
 
 ### 4.6 四阶段对比图（任务 6）
 
-把上面四张图拼成 1×4 的对比图 `comparison_grid.png`，标题清楚标出各阶段名称：
+把上面四张图拼成 1×4 的对比图 comparison.png，标题清楚标出各阶段名称：
 
 ```
 (a) Template + Weights  |  (b) Shape + Joints  |  (c) Pose Offsets  |  (d) Final LBS
@@ -216,11 +211,11 @@ $$A_k = G_k \cdot \begin{pmatrix} I & -J_k^0 \\ 0 & 1 \end{pmatrix}$$
 
 ### 4.7 一致性验证（任务 7）
 
-用完全相同的 `betas`、`global_orient`、`body_pose` 分别调用手写 LBS 和官方 smplx 前向，逐顶点做误差比对：
+用完全相同的 betas、globalOrient、bodyPose 分别调用手写 LBS 和官方 smplx 前向，逐顶点做误差比对：
 
 ```python
-out = model(betas=betas, global_orient=global_orient, body_pose=body_pose)
-diff = (verts_manual - out.vertices).abs()
+out = model(betas=betas, globalOrient=globalOrient, bodyPose=bodyPose)
+diff = (vertsManual - out.vertices).abs()
 print(f"MAE: {diff.mean():.6f} m")
 print(f"Max: {diff.max():.6f} m")
 ```
@@ -232,11 +227,11 @@ print(f"Max: {diff.max():.6f} m")
 固定 $\beta$，让双肘关节从 0° 逐渐弯曲到约 83° 再回到 0°，生成 36 帧并导出 GIF：
 
 ```python
-for i in range(n_frames):
+for i in range(frameCount):
     angle = 1.45 * np.sin(t * np.pi)    # 正弦曲线驱动，保证起止平滑
     pa[0, 3 * 18 + 2] =  angle          # 左肘
     pa[0, 3 * 19 + 2] = -angle          # 右肘（镜像）
-    verts_frame, ... = lbs_forward(...)
+    vertsFrame, ... = lbsForward(...)
 ```
 
 可以明显看到：
@@ -248,14 +243,14 @@ for i in range(n_frames):
 
 另外额外生成两个展示型 GIF：
 
-- `pipeline_animation.gif`：把 template → shaped → pose corrective → final LBS 连续过渡成动画，便于展示每一步到底改变了什么。
-- `joint_weight_sweep.gif`：轮播多个代表关节的蒙皮权重热力图，展示权重如何沿躯干、手臂和手部平滑分布。
+- video4.gif：把 template → shaped → pose corrective → final LBS 连续过渡成动画，便于展示每一步到底改变了什么。
+- weightsweep.gif：轮播多个代表关节的蒙皮权重热力图，展示权重如何沿躯干、手臂和手部平滑分布。
 
 ---
 
 ## 5 运行方式
 
-需要先把 `SMPL_NEUTRAL.pkl` 放入 `models/` 目录（[师大云盘下载](https://pan.bnu.edu.cn/l/t16N1T)，仅供学习使用）。
+需要先把 SMPL neutral 模型 pkl 文件放入 models 目录（[师大云盘下载](https://pan.bnu.edu.cn/l/t16N1T)，仅供学习使用）。
 
 ```bash
 # 安装依赖（使用 uv）
@@ -269,26 +264,20 @@ uv run python main.py
 
 ```
 outputs/
-├── stage_a_template_weights.png
 ├── stagea.png
-├── all_joint_weights.png
 ├── allweights.png
-├── stage_b_shaped_joints.png
 ├── stageb.png
-├── stage_c_pose_offsets.png
 ├── stagec.png
-├── stage_d_lbs_result.png
 ├── staged.png
-├── comparison_grid.png
 ├── comparison.png
 ├── video1.gif
 ├── video2.gif
 ├── video3.gif
 ├── video4.gif
 ├── video5.gif
-├── pipeline_animation.gif
-├── joint_weight_sweep.gif
-├── pose_animation.gif
+├── pipeline.gif
+├── weightsweep.gif
+├── pose.gif
 └── summary.txt
 ```
 
@@ -306,7 +295,7 @@ outputs/
 
 ![Stage B](outputs/stageb.png)
 
-$\beta_0 = 2.0$（偏胖），$\beta_1 = -1.5$（偏高），体型明显变化；红点是从形状后网格回归出的关节位置，落在身体内部合理位置。
+$\beta0 = 2.0$（偏胖），$\beta1 = -1.5$（偏高），体型明显变化；红点是从形状后网格回归出的关节位置，落在身体内部合理位置。
 
 ### 阶段 (c)：姿态校正偏移
 
@@ -348,9 +337,9 @@ $\beta_0 = 2.0$（偏胖），$\beta_1 = -1.5$（偏高），体型明显变化�
 
 ## 7 遇到的问题和解决
 
-1. **`batch_rigid_transform` 里 A 的推导**：一开始直接用 $G_k$ 做蒙皮，结果 T-pose 下顶点就跑飞了。查了 smplx 源码才理解需要减去 rest-pose 关节位移：`A = G - F.pad(G @ j_homogen, [3,0,...])`，本质上就是 $G_k \cdot \text{inv\_rest}_k$。
+1. **rigidTransform 里 A 的推导**：一开始直接用 $G^{k}$ 做蒙皮，结果 T-pose 下顶点就跑飞了。查了 smplx 源码才理解需要减去 rest-pose 关节位移，本质上就是 $G^{k}$ 乘以 invRest。
 
-2. **`posedirs` 的维度**：pkl 文件里原始是 `(V, 3, P)`，smplx 加载时会 reshape + 转置成 `(P, V*3)`。直接 `torch.matmul(pose_feature, posedirs)` 就对，不用再手动转置，踩坑在这里浪费了不少时间。
+2. **posedirs 的维度**：pkl 文件里原始是 `(V, 3, P)`，smplx 加载时会 reshape + 转置成 `(P, V*3)`。直接用 poseFeature 乘 pose directions 就对，不用再手动转置，踩坑在这里浪费了不少时间。
 
 3. **matplotlib 3D 渲染速度**：14k 个三角面全渲会比较慢，而且 `Poly3DCollection` 的 z-sort 在某些角度会有穿插。最终静态图保留完整面片以保证报告观感，GIF 固定子采样到约 4200 个面来控制文件体积和生成时间。
 
@@ -364,5 +353,6 @@ $\beta_0 = 2.0$（偏胖），$\beta_1 = -1.5$（偏高），体型明显变化�
 
 - **形状和姿态是解耦的**：$\beta$ 只改体型，$\theta$ 只控姿态，两者通过不同的 blend shape 分别叠加，互不干扰
 - **pose corrective 的必要性**：纯 LBS 在弯曲处的体积缺失是真实存在的视觉问题，pose corrective 用一个学习到的线性补丁解决得相当优雅
-- **运动学树的累乘**：每个关节的全局变换是从根到它的所有局部旋转的矩阵乘积，理解这个才能正确实现 `batch_rigid_transform`
+- **运动学树的累乘**：每个关节的全局变换是从根到它的所有局部旋转的矩阵乘积，理解这个才能正确实现 rigidTransform
 - **验证误差 $\approx 10^{-5}$ m**：手写结果和官方前向几乎完全一致，说明实现是正确的
+
